@@ -315,9 +315,15 @@ def _load_cache_from_disk() -> None:
             return
         with _CACHE_FILE.open("r", encoding="utf-8") as f:
             snapshot = json.load(f)
+        items = snapshot.get("items", [])
+        # Retroactively dedupe cached messages so historic snapshots don't
+        # show the CRM-duplicated bubbles
+        for it in items:
+            if it.get("messages"):
+                it["messages"] = _dedupe_messages(it["messages"])
         _unknown_cache = {
             "count": snapshot.get("count", 0),
-            "items": snapshot.get("items", []),
+            "items": items,
             "strategies": snapshot.get("strategies", {}),
         }
         _unknown_cache_at = snapshot.get("saved_at", 0.0)
@@ -412,9 +418,58 @@ def _fetch_unknown_for(slug: str) -> list[dict]:
     return out
 
 
+from datetime import datetime
+
+_OUTBOUND_TYPES = {"outbound", "sent", "agent"}
+
+
+def _parse_ts(v: Any) -> float | None:
+    if not v:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        # ISO-8601 with or without timezone
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _dedupe_messages(msgs: list[dict]) -> list[dict]:
+    """Drop outbound duplicates: same text as a prior outbound message within
+    1 hour. Preserves inbound (prospect) messages untouched — the CRM bug only
+    duplicates our side. Order is preserved; the earliest copy wins."""
+    out: list[dict] = []
+    for m in msgs:
+        is_outbound = (m.get("type") or "").lower() in _OUTBOUND_TYPES
+        text = (m.get("message_text") or "").strip()
+        if is_outbound and text:
+            ts = _parse_ts(m.get("timestamp"))
+            is_dup = False
+            for prev in reversed(out):
+                if (prev.get("type") or "").lower() not in _OUTBOUND_TYPES:
+                    continue
+                if (prev.get("message_text") or "").strip() != text:
+                    continue
+                pts = _parse_ts(prev.get("timestamp"))
+                if ts is not None and pts is not None:
+                    if abs(ts - pts) <= 3600:
+                        is_dup = True
+                        break
+                else:
+                    # Missing timestamps: still dedupe (adjacent same text)
+                    is_dup = True
+                    break
+            if is_dup:
+                continue
+        out.append(m)
+    return out
+
+
 def _fetch_messages(item: dict) -> tuple[str, list[dict]]:
     """Returns (conversation_id, messages). Empty list on failure — UI is
-    resilient to empty conversations."""
+    resilient to empty conversations. Messages are deduped to work around the
+    CRM bug that occasionally emits identical outbound messages back-to-back."""
     cid = item["conversation_id"]
     try:
         with McpBorrow() as mcp:
@@ -423,7 +478,8 @@ def _fetch_messages(item: dict) -> tuple[str, list[dict]]:
                 "conversation_id": cid,
                 "client_id": CLIENT_ID,
             })
-        return cid, (r or {}).get("messages", [])
+        raw = (r or {}).get("messages", [])
+        return cid, _dedupe_messages(raw)
     except Exception as e:
         log.warning(f"prefetch messages failed for {cid}: {e}")
         return cid, []
@@ -608,7 +664,7 @@ def _get_conversation(product_slug: str, conversation_id: str) -> dict:
         })
     if not r:
         raise HTTPException(status_code=404, detail="conversation not found")
-    return {"messages": r.get("messages", []), "strategy": strategy}
+    return {"messages": _dedupe_messages(r.get("messages", [])), "strategy": strategy}
 
 
 @app.get("/api/conversation", dependencies=[Depends(require_token)])
