@@ -70,16 +70,14 @@ async def _on_startup():
 
 
 async def _cache_keepalive():
-    """Periodically refresh the UNKNOWN cache so HTTP requests always hit warm
-    data. TTL is the cadence — slightly faster than the HTTP-path TTL so users
-    never catch a stale cache boundary."""
-    period = max(10.0, _UNKNOWN_TTL - 5.0)
+    """Periodically refresh the UNKNOWN cache in the background. Doesn't race
+    user-facing endpoints (those use the dedicated realtime client)."""
     while True:
         try:
             await asyncio.get_event_loop().run_in_executor(None, _refresh_unknown_cache)
         except Exception as e:
             log.exception(f"cache keepalive error: {e}")
-        await asyncio.sleep(period)
+        await asyncio.sleep(_UNKNOWN_TTL)
 
 
 # --- MCP client pool ------------------------------------------------------
@@ -96,6 +94,13 @@ import queue  # noqa: E402
 _pool_created = 0
 _pool_create_lock = threading.Lock()
 
+# Dedicated client for user-facing requests (/api/conversation, /api/classify).
+# Never borrowed by the list-refresh workers, so taps on the UI never wait on
+# the slow MCP list fetch that saturates the pool.
+_realtime_client: McpClient | None = None
+_realtime_lock = threading.Lock()
+_realtime_init_lock = threading.Lock()
+
 
 def _ensure_pool():
     """Lazy init: creates `queue.Queue` on first use, no blocking at startup."""
@@ -104,6 +109,18 @@ def _ensure_pool():
         with _pool_create_lock:
             if _pool is None:
                 _pool = queue.Queue()
+
+
+def _get_realtime() -> McpClient:
+    """One long-lived MCP client reserved for interactive UI calls. Serialized
+    with _realtime_lock (MCP sessions aren't thread-safe)."""
+    global _realtime_client
+    if _realtime_client is None:
+        with _realtime_init_lock:
+            if _realtime_client is None:
+                log.info("creating realtime MCP client")
+                _realtime_client = McpClient(CLIENT_ID)
+    return _realtime_client
 
 
 class McpBorrow:
@@ -138,8 +155,13 @@ class McpBorrow:
 # always instant once the service has been up for a few seconds.
 _unknown_cache: dict | None = None
 _unknown_cache_at: float = 0.0
-_UNKNOWN_TTL = 45.0  # how stale before /api/unknown triggers a synchronous refresh
+_UNKNOWN_TTL = 120.0  # stale-while-revalidate: cache served even past TTL
 _refresh_lock = threading.Lock()
+
+# Product strategy cache — pitch/ICP don't change during a session, no need
+# to re-fetch on every card load.
+_strategy_cache: dict[str, dict] = {}
+_strategy_cache_lock = threading.Lock()
 
 
 # --- Auth dependency ------------------------------------------------------
@@ -238,28 +260,44 @@ async def list_unknown(refresh: bool = False):
     return {**data, "cached": False}
 
 
+def _get_strategy(product_slug: str) -> dict:
+    """Per-slug strategy cache. Product strategy doesn't change during a
+    review session, so fetching once per deployment is plenty."""
+    cached = _strategy_cache.get(product_slug)
+    if cached is not None:
+        return cached
+    with _strategy_cache_lock:
+        cached = _strategy_cache.get(product_slug)
+        if cached is not None:
+            return cached
+        with _realtime_lock:
+            mcp = _get_realtime()
+            strat = mcp.call("configure_product_strategy", {
+                "product_slug": product_slug,
+                "client_id": CLIENT_ID,
+            }) or {}
+        mp = (strat.get("current") or {}).get("market_position", {}).get("data", {})
+        payload = {
+            "market_category": mp.get("market_category"),
+            "one_line_pitch": mp.get("one_line_pitch"),
+            "icp": (mp.get("icp") or "")[:600],
+        }
+        _strategy_cache[product_slug] = payload
+        return payload
+
+
 def _get_conversation(product_slug: str, conversation_id: str) -> dict:
-    with McpBorrow() as mcp:
+    strategy = _get_strategy(product_slug)
+    with _realtime_lock:
+        mcp = _get_realtime()
         r = mcp.call("get_conversation_by_id", {
             "product_slug": product_slug,
             "conversation_id": conversation_id,
             "client_id": CLIENT_ID,
         })
-        if not r:
-            raise HTTPException(status_code=404, detail="conversation not found")
-        strat = mcp.call("configure_product_strategy", {
-            "product_slug": product_slug,
-            "client_id": CLIENT_ID,
-        }) or {}
-    mp = (strat.get("current") or {}).get("market_position", {}).get("data", {})
-    return {
-        "messages": r.get("messages", []),
-        "strategy": {
-            "market_category": mp.get("market_category"),
-            "one_line_pitch": mp.get("one_line_pitch"),
-            "icp": (mp.get("icp") or "")[:600],
-        },
-    }
+    if not r:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return {"messages": r.get("messages", []), "strategy": strategy}
 
 
 @app.get("/api/conversation", dependencies=[Depends(require_token)])
@@ -269,7 +307,8 @@ async def get_conversation(product_slug: str, conversation_id: str):
 
 
 def _change_state(product_slug: str, customer_name: str, category: str) -> bool:
-    with McpBorrow() as mcp:
+    with _realtime_lock:
+        mcp = _get_realtime()
         return mcp.call("change_crm_state", {
             "product_slug": product_slug,
             "customer_name": customer_name,

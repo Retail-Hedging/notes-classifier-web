@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   readToken,
   fetchUnknown,
@@ -9,6 +9,8 @@ import {
 } from "./api";
 
 type Status = "loading" | "ready" | "empty" | "error" | "unauthorized";
+
+const PREFETCH_AHEAD = 3;
 
 const STATE_BUTTONS: Array<{ value: string; label: string; color: string }> = [
   { value: "DISQUALIFIED", label: "❌ DQ",           color: "bg-red-600 active:bg-red-700" },
@@ -119,9 +121,14 @@ export default function App() {
   const [status, setStatus] = useState<Status>("loading");
   const [items, setItems] = useState<UnknownItem[]>([]);
   const [index, setIndex] = useState(0);
-  const [convo, setConvo] = useState<ConversationPayload | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Conversation cache keyed by conversation_id; prefetches populate it in
+  // the background so clicking Next is instant.
+  const convoCacheRef = useRef<Map<string, ConversationPayload>>(new Map());
+  const inFlightRef = useRef<Set<string>>(new Set());
+  // Bumped to force re-render when the cache changes
+  const [, setTick] = useState(0);
 
   useEffect(() => {
     if (!token) {
@@ -140,13 +147,30 @@ export default function App() {
   }, [token]);
 
   const current = items[index];
+  const convo = current ? convoCacheRef.current.get(current.conversation_id) ?? null : null;
+
+  // Prefetch: load current + N ahead. Each fetch is stored in the cache.
   useEffect(() => {
     if (!token || !current) return;
-    setConvo(null);
-    fetchConversation(token, current.product_slug, current.conversation_id)
-      .then(setConvo)
-      .catch(() => setConvo({ messages: [], strategy: {} }));
-  }, [current?.product_slug, current?.conversation_id, token]);
+    for (let k = 0; k <= PREFETCH_AHEAD; k++) {
+      const next = items[index + k];
+      if (!next) break;
+      const id = next.conversation_id;
+      if (convoCacheRef.current.has(id) || inFlightRef.current.has(id)) continue;
+      inFlightRef.current.add(id);
+      fetchConversation(token, next.product_slug, id)
+        .then((c) => {
+          convoCacheRef.current.set(id, c);
+          setTick((t) => t + 1);
+        })
+        .catch(() => {
+          convoCacheRef.current.set(id, { messages: [], strategy: {} });
+          setTick((t) => t + 1);
+        })
+        .finally(() => inFlightRef.current.delete(id));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [index, items, token]);
 
   async function handleClassify(newState: string) {
     if (!token || !current) return;
