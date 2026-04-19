@@ -226,10 +226,13 @@ def _refresh_unknown_cache() -> dict:
 
 @app.get("/api/unknown", dependencies=[Depends(require_token)])
 async def list_unknown(refresh: bool = False):
+    """Stale-while-revalidate: if a cached snapshot exists, return it
+    immediately even if it's past TTL. The background keepalive owns
+    refreshing. Only block on a synchronous refresh when the cache has
+    never been populated (cold boot), or when refresh=true is passed."""
     now = time.time()
-    if _unknown_cache and not refresh and (now - _unknown_cache_at) < _UNKNOWN_TTL:
+    if _unknown_cache and not refresh:
         return {**_unknown_cache, "cached": True, "cache_age": int(now - _unknown_cache_at)}
-    # Cold or expired — refresh in a worker thread so the async event loop stays free
     loop = asyncio.get_event_loop()
     data = await loop.run_in_executor(None, _refresh_unknown_cache)
     return {**data, "cached": False}
