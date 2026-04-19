@@ -3,6 +3,8 @@ backend/.env
 backend/service.log
 backend/unknown_cache.json
 backend/unknown_cache.json.tmp
+backend/classify_queue.json
+backend/classify_queue.json.tmp
 backend/__pycache__/
 backend/*.pyc
 frontend/node_modules/

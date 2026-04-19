@@ -63,16 +63,22 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _on_startup():
-    """Non-blocking: load disk cache so we serve instantly from a cold boot,
-    schedule the hourly background refresh, and if the loaded snapshot is
-    missing message content anywhere, kick off an immediate Phase B fill."""
+    """Non-blocking startup:
+      - restore disk cache so the list is served instantly from cold boot
+      - restore pending classify queue (in case a previous run enqueued but
+        hadn't flushed before shutdown)
+      - schedule hourly unknown-list refresh
+      - schedule 5-minute classify-queue drain
+    """
     _ensure_pool()
     _load_cache_from_disk()
+    _load_queue()
     asyncio.create_task(_cache_keepalive())
+    asyncio.create_task(_drain_queue_loop())
     if _unknown_cache and any(not it.get("messages") for it in _unknown_cache.get("items", [])):
         log.info("disk cache is missing messages; scheduling immediate fill")
         asyncio.get_event_loop().run_in_executor(None, _fill_messages_for_current_cache)
-    log.info("startup complete; cache keepalive scheduled (hourly)")
+    log.info("startup complete; hourly refresh + 5-min queue drain scheduled")
 
 
 def _fill_messages_for_current_cache():
@@ -198,6 +204,104 @@ _refresh_lock = threading.Lock()
 # Product strategy cache — pitch/ICP don't change during a session.
 _strategy_cache: dict[str, dict] = {}
 _strategy_cache_lock = threading.Lock()
+
+
+# --- Classify queue --------------------------------------------------------
+# /api/classify enqueues rather than hitting MCP inline — MCP's change_crm_state
+# can take many seconds and was making the UI feel frozen on each tap. A
+# background drainer flushes the queue every _QUEUE_FLUSH_INTERVAL seconds.
+_QUEUE_FILE = Path(__file__).parent / "classify_queue.json"
+_QUEUE_FLUSH_INTERVAL = 300.0  # 5 minutes
+_classify_queue: list[dict] = []
+_classify_queue_lock = threading.Lock()
+
+
+def _persist_queue() -> None:
+    try:
+        tmp = _QUEUE_FILE.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(_classify_queue, f, ensure_ascii=False)
+        tmp.replace(_QUEUE_FILE)
+    except Exception as e:
+        log.warning(f"persist queue failed: {e}")
+
+
+def _load_queue() -> None:
+    global _classify_queue
+    try:
+        if not _QUEUE_FILE.exists():
+            return
+        with _QUEUE_FILE.open("r", encoding="utf-8") as f:
+            _classify_queue = json.load(f) or []
+        if _classify_queue:
+            log.info(f"loaded classify queue: {len(_classify_queue)} pending")
+    except Exception as e:
+        log.warning(f"load queue failed: {e}")
+        _classify_queue = []
+
+
+def _enqueue_classify(product_slug: str, customer_name: str, new_state: str) -> None:
+    entry = {
+        "product_slug": product_slug,
+        "customer_name": customer_name,
+        "new_state": new_state,
+        "queued_at": time.time(),
+    }
+    with _classify_queue_lock:
+        _classify_queue.append(entry)
+        _persist_queue()
+    # Also drop the item from the in-memory cache so the list shrinks on next
+    # /api/unknown. MCP hasn't actually flipped state yet, but the user's
+    # intent is clear and we don't want the same convo to keep appearing.
+    global _unknown_cache
+    if _unknown_cache:
+        _unknown_cache["items"] = [
+            it for it in _unknown_cache["items"]
+            if not (it.get("product_slug") == product_slug
+                    and it.get("customer_name") == customer_name)
+        ]
+        _unknown_cache["count"] = len(_unknown_cache["items"])
+        _persist_cache_to_disk()
+
+
+async def _drain_queue_loop():
+    """Flush pending classifications to MCP every _QUEUE_FLUSH_INTERVAL seconds."""
+    # Drain on startup once (short grace), then every interval
+    await asyncio.sleep(10)
+    while True:
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _drain_queue_once)
+        except Exception as e:
+            log.exception(f"queue drain error: {e}")
+        await asyncio.sleep(_QUEUE_FLUSH_INTERVAL)
+
+
+def _drain_queue_once() -> None:
+    with _classify_queue_lock:
+        batch = list(_classify_queue)
+    if not batch:
+        return
+    log.info(f"queue drain: applying {len(batch)} classification(s)")
+    applied: list[dict] = []
+    failed: list[dict] = []
+    for entry in batch:
+        try:
+            ok = _change_state(
+                entry["product_slug"], entry["customer_name"], entry["new_state"],
+            )
+        except Exception as e:
+            log.warning(f"queue: change_state raised for {entry['customer_name']}: {e}")
+            ok = False
+        (applied if ok else failed).append(entry)
+    with _classify_queue_lock:
+        remaining: list[dict] = []
+        for entry in _classify_queue:
+            if entry in applied:
+                continue
+            remaining.append(entry)
+        _classify_queue[:] = remaining
+        _persist_queue()
+    log.info(f"queue drain done: {len(applied)} applied, {len(failed)} still pending")
 
 
 def _load_cache_from_disk() -> None:
@@ -528,16 +632,18 @@ def _change_state(product_slug: str, customer_name: str, category: str) -> bool:
 async def classify(body: ClassifyBody):
     if body.new_state.upper() not in VALID_STATES:
         raise HTTPException(status_code=400, detail=f"new_state must be one of {sorted(VALID_STATES)}")
-    loop = asyncio.get_event_loop()
-    ok = await loop.run_in_executor(None, _change_state, body.product_slug, body.customer_name, body.new_state.upper())
-    result = {"ok": True} if ok else None
-    if result is None:
-        raise HTTPException(status_code=502, detail="change_crm_state failed")
-    log.info(f"reclassified {body.product_slug}/{body.customer_name} -> {body.new_state.upper()}")
-    # Don't invalidate cache — frontend already tracks the local list and
-    # advances past the classified item. The background keepalive will drop
-    # the item on its next refresh cycle (~40s).
-    return {"ok": True, "new_state": body.new_state.upper()}
+    new_state = body.new_state.upper()
+    _enqueue_classify(body.product_slug, body.customer_name, new_state)
+    log.info(
+        f"queued reclassify {body.product_slug}/{body.customer_name} -> {new_state} "
+        f"(queue depth {len(_classify_queue)})"
+    )
+    return {
+        "ok": True,
+        "queued": True,
+        "new_state": new_state,
+        "queue_depth": len(_classify_queue),
+    }
 
 
 # --- Static frontend ------------------------------------------------------
