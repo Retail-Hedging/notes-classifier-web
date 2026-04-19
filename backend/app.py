@@ -202,14 +202,18 @@ async def health():
 
 
 def _fetch_unknown_for(slug: str) -> list[dict]:
-    with McpBorrow() as mcp:
-        r = mcp.call("crm_customers_by_state", {
-            "product_slug": slug,
-            "states": ["UNKNOWN"],
-            "client_id": CLIENT_ID,
-            "limit": 500,
-            "include_conversations": False,
-        })
+    try:
+        with McpBorrow() as mcp:
+            r = mcp.call("crm_customers_by_state", {
+                "product_slug": slug,
+                "states": ["UNKNOWN"],
+                "client_id": CLIENT_ID,
+                "limit": 500,
+                "include_conversations": False,
+            })
+    except Exception as e:
+        log.warning(f"list UNKNOWN failed for {slug}: {type(e).__name__}: {e}")
+        return []
     out = []
     for c in (r or {}).get("customers", []):
         out.append({
@@ -222,27 +226,128 @@ def _fetch_unknown_for(slug: str) -> list[dict]:
     return out
 
 
+def _fetch_messages(item: dict) -> tuple[str, list[dict]]:
+    """Returns (conversation_id, messages). Empty list on failure — UI is
+    resilient to empty conversations."""
+    cid = item["conversation_id"]
+    try:
+        with McpBorrow() as mcp:
+            r = mcp.call("get_conversation_by_id", {
+                "product_slug": item["product_slug"],
+                "conversation_id": cid,
+                "client_id": CLIENT_ID,
+            })
+        return cid, (r or {}).get("messages", [])
+    except Exception as e:
+        log.warning(f"prefetch messages failed for {cid}: {e}")
+        return cid, []
+
+
+def _fetch_strategy_pool(slug: str) -> dict:
+    """Pool-based strategy fetch used during cache refresh. Populates the
+    realtime-side _strategy_cache too so later UI calls don't re-fetch."""
+    if slug in _strategy_cache:
+        return _strategy_cache[slug]
+    try:
+        with McpBorrow() as mcp:
+            strat = mcp.call("configure_product_strategy", {
+                "product_slug": slug,
+                "client_id": CLIENT_ID,
+            }) or {}
+    except Exception:
+        strat = {}
+    mp = (strat.get("current") or {}).get("market_position", {}).get("data", {})
+    payload = {
+        "market_category": mp.get("market_category"),
+        "one_line_pitch": mp.get("one_line_pitch"),
+        "icp": (mp.get("icp") or "")[:600],
+    }
+    with _strategy_cache_lock:
+        _strategy_cache[slug] = payload
+    return payload
+
+
+def _safe_active_products() -> list[str]:
+    try:
+        with McpBorrow() as mcp:
+            return _active_products(mcp)
+    except Exception as e:
+        log.warning(f"_active_products failed: {type(e).__name__}: {e}")
+        return []
+
+
 def _refresh_unknown_cache() -> dict:
-    """Blocking refresh. Coalesces concurrent callers via _refresh_lock so the
-    MCP server sees at most one refresh in flight at a time."""
+    """Two-phase refresh:
+      Phase A (fast): list + strategies. Cache is populated immediately with
+        empty messages per item, so /api/unknown can return the review list
+        without waiting on per-conversation fetches.
+      Phase B (slow): fills message arrays in-place, in the background. The
+        in-memory cache item is the same object, so subsequent /api/unknown
+        responses see messages as they land.
+    Fault-tolerant at every step."""
     global _unknown_cache, _unknown_cache_at
     from concurrent.futures import ThreadPoolExecutor
     with _refresh_lock:
-        # Double-checked: a caller may have refreshed while we waited for the lock
         now = time.time()
         if _unknown_cache and (now - _unknown_cache_at) < _UNKNOWN_TTL:
             return _unknown_cache
         t0 = time.time()
-        with McpBorrow() as mcp:
-            slugs = _active_products(mcp)
-        # Parallelize across pool — at most _POOL_SIZE concurrent MCP calls
-        with ThreadPoolExecutor(max_workers=_POOL_SIZE) as pool:
-            buckets = list(pool.map(_fetch_unknown_for, slugs))
-        items: list[dict] = [it for bucket in buckets for it in bucket]
-        items.sort(key=lambda x: x.get("last_message_timestamp", ""), reverse=True)
-        _unknown_cache = {"count": len(items), "items": items}
-        _unknown_cache_at = time.time()
-        log.info(f"unknown cache refreshed: {len(items)} items in {time.time()-t0:.1f}s")
+
+        try:
+            slugs = _safe_active_products()
+            if not slugs:
+                log.warning("no active products; keeping previous cache")
+                return _unknown_cache or {"count": 0, "items": [], "strategies": {}}
+
+            with ThreadPoolExecutor(max_workers=_POOL_SIZE) as pool:
+                buckets = list(pool.map(_fetch_unknown_for, slugs))
+            items: list[dict] = [it for bucket in buckets for it in bucket]
+            items.sort(key=lambda x: x.get("last_message_timestamp", ""), reverse=True)
+            for it in items:
+                it.setdefault("messages", [])
+
+            slugs_referenced = sorted({it["product_slug"] for it in items})
+            with ThreadPoolExecutor(max_workers=_POOL_SIZE) as pool:
+                list(pool.map(_fetch_strategy_pool, slugs_referenced))
+            strategies = {slug: _strategy_cache.get(slug, {}) for slug in slugs_referenced}
+
+            # Phase A: publish list + strategies immediately
+            _unknown_cache = {
+                "count": len(items),
+                "items": items,
+                "strategies": strategies,
+            }
+            _unknown_cache_at = time.time()
+            log.info(
+                f"unknown cache (list) ready: {len(items)} items, "
+                f"{len(strategies)} strategies in {time.time()-t0:.1f}s"
+            )
+        except Exception as e:
+            log.exception(f"_refresh_unknown_cache fatal in phase A: {e}")
+            return _unknown_cache or {"count": 0, "items": [], "strategies": {}}
+
+        # Phase B: populate messages in background via a daemon thread so we
+        # return from _refresh_unknown_cache now
+        def _fill_messages(items_ref: list[dict]):
+            try:
+                t1 = time.time()
+                with ThreadPoolExecutor(max_workers=_POOL_SIZE) as pool:
+                    pairs = list(pool.map(_fetch_messages, items_ref))
+                msg_map = dict(pairs)
+                for it in items_ref:
+                    it["messages"] = msg_map.get(it["conversation_id"], [])
+                log.info(
+                    f"unknown cache messages filled: "
+                    f"{sum(len(m) for m in msg_map.values())} msgs "
+                    f"in {time.time()-t1:.1f}s"
+                )
+            except Exception as e:
+                log.warning(f"phase B (fill messages) error: {e}")
+
+        threading.Thread(
+            target=_fill_messages, args=(items,), daemon=True, name="fill-msgs"
+        ).start()
+
         return _unknown_cache
 
 

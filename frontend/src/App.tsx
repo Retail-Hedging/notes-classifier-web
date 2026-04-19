@@ -4,8 +4,9 @@ import {
   fetchUnknown,
   fetchConversation,
   classify,
+  type Message,
   type UnknownItem,
-  type ConversationPayload,
+  type Strategy,
 } from "./api";
 
 type Status = "loading" | "ready" | "empty" | "error" | "unauthorized";
@@ -32,13 +33,17 @@ function relativeTime(iso: string): string {
 
 function ConvoCard({
   item,
-  convo,
+  strategy,
+  messages,
+  messagesLoading,
   busy,
   error,
   onClassify,
 }: {
   item: UnknownItem;
-  convo: ConversationPayload | null;
+  strategy: Strategy | undefined;
+  messages: Message[];
+  messagesLoading: boolean;
   busy: boolean;
   error: string | null;
   onClassify: (s: string) => void;
@@ -51,10 +56,10 @@ function ConvoCard({
           <div className="text-xs text-zinc-500 flex-none">{relativeTime(item.last_message_timestamp)}</div>
         </div>
         <div className="text-lg font-semibold truncate">{item.customer_name}</div>
-        {convo?.strategy?.one_line_pitch && (
+        {strategy?.one_line_pitch && (
           <div className="text-xs text-zinc-500 mt-1 truncate">
             <span className="text-zinc-400">Pitch: </span>
-            {convo.strategy.one_line_pitch}
+            {strategy.one_line_pitch}
           </div>
         )}
       </div>
@@ -66,12 +71,12 @@ function ConvoCard({
             <div className="whitespace-pre-wrap break-words">{item.note}</div>
           </div>
         )}
-        {convo === null ? (
+        {messagesLoading ? (
           <div className="text-zinc-500 text-sm animate-pulse">loading conversation…</div>
-        ) : convo.messages.length === 0 ? (
+        ) : messages.length === 0 ? (
           <div className="text-zinc-500 text-sm italic">no messages in this conversation</div>
         ) : (
-          convo.messages.map((m, i) => {
+          messages.map((m, i) => {
             const outbound = m.type === "outbound" || m.type === "sent";
             return (
               <div
@@ -91,10 +96,10 @@ function ConvoCard({
             );
           })
         )}
-        {convo?.strategy?.icp && (
+        {strategy?.icp && (
           <details className="text-xs text-zinc-500 pt-4">
             <summary className="cursor-pointer">ICP context</summary>
-            <div className="pt-1 whitespace-pre-wrap">{convo.strategy.icp}</div>
+            <div className="pt-1 whitespace-pre-wrap">{strategy.icp}</div>
           </details>
         )}
       </div>
@@ -120,15 +125,10 @@ export default function App() {
   const token = useMemo(readToken, []);
   const [status, setStatus] = useState<Status>("loading");
   const [items, setItems] = useState<UnknownItem[]>([]);
+  const [strategies, setStrategies] = useState<Record<string, Strategy>>({});
   const [index, setIndex] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // Conversation cache keyed by conversation_id; prefetches populate it in
-  // the background so clicking Next is instant.
-  const convoCacheRef = useRef<Map<string, ConversationPayload>>(new Map());
-  const inFlightRef = useRef<Set<string>>(new Set());
-  // Bumped to force re-render when the cache changes
-  const [, setTick] = useState(0);
 
   useEffect(() => {
     if (!token) {
@@ -137,9 +137,10 @@ export default function App() {
     }
     (async () => {
       try {
-        const list = await fetchUnknown(token);
-        setItems(list);
-        setStatus(list.length ? "ready" : "empty");
+        const data = await fetchUnknown(token);
+        setItems(data.items);
+        setStrategies(data.strategies || {});
+        setStatus(data.items.length ? "ready" : "empty");
       } catch (e: any) {
         setStatus(e?.message === "unauthorized" ? "unauthorized" : "error");
       }
@@ -147,30 +148,46 @@ export default function App() {
   }, [token]);
 
   const current = items[index];
-  const convo = current ? convoCacheRef.current.get(current.conversation_id) ?? null : null;
+  const strategy = current ? strategies[current.product_slug] : undefined;
 
-  // Prefetch: load current + N ahead. Each fetch is stored in the cache.
+  // Overlay cache for messages fetched via /api/conversation — used as a
+  // fallback when the backend's embedded `item.messages` is still empty
+  // because Phase-B preload hasn't finished yet.
+  const msgCacheRef = useRef<Map<string, Message[]>>(new Map());
+  const inFlightRef = useRef<Set<string>>(new Set());
+  const [, setTick] = useState(0);
+
   useEffect(() => {
     if (!token || !current) return;
     for (let k = 0; k <= PREFETCH_AHEAD; k++) {
-      const next = items[index + k];
-      if (!next) break;
-      const id = next.conversation_id;
-      if (convoCacheRef.current.has(id) || inFlightRef.current.has(id)) continue;
+      const target = items[index + k];
+      if (!target) break;
+      if ((target.messages ?? []).length) continue;
+      const id = target.conversation_id;
+      if (msgCacheRef.current.has(id) || inFlightRef.current.has(id)) continue;
       inFlightRef.current.add(id);
-      fetchConversation(token, next.product_slug, id)
+      fetchConversation(token, target.product_slug, id)
         .then((c) => {
-          convoCacheRef.current.set(id, c);
+          msgCacheRef.current.set(id, c.messages);
           setTick((t) => t + 1);
         })
         .catch(() => {
-          convoCacheRef.current.set(id, { messages: [], strategy: {} });
+          msgCacheRef.current.set(id, []);
           setTick((t) => t + 1);
         })
         .finally(() => inFlightRef.current.delete(id));
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [index, items, token]);
+  }, [index, items, token, current]);
+
+  const cid = current?.conversation_id;
+  const messages: Message[] = current
+    ? (current.messages && current.messages.length
+        ? current.messages
+        : msgCacheRef.current.get(cid!) ?? [])
+    : [];
+  const messagesLoading = !!current
+    && (current.messages ?? []).length === 0
+    && !msgCacheRef.current.has(cid!);
 
   async function handleClassify(newState: string) {
     if (!token || !current) return;
@@ -244,7 +261,9 @@ export default function App() {
       <div className="flex-1 min-h-0">
         <ConvoCard
           item={current}
-          convo={convo}
+          strategy={strategy}
+          messages={messages}
+          messagesLoading={messagesLoading}
           busy={busy}
           error={error}
           onClassify={handleClassify}

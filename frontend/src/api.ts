@@ -16,32 +16,37 @@ function authHeaders(token: string) {
   return { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
 }
 
+export type Message = { type: string; from: string; message_text: string; timestamp?: string };
+
+export type Strategy = { market_category?: string; one_line_pitch?: string; icp?: string };
+
 export type UnknownItem = {
   product_slug: string;
   conversation_id: string;
   customer_name: string;
   note: string;
   last_message_timestamp: string;
+  messages: Message[]; // preloaded by backend
 };
 
-export type ConversationPayload = {
-  messages: Array<{ type: string; from: string; message_text: string; timestamp?: string }>;
-  strategy: { market_category?: string; one_line_pitch?: string; icp?: string };
+export type UnknownResponse = {
+  count: number;
+  items: UnknownItem[];
+  strategies: Record<string, Strategy>;
 };
 
-export async function fetchUnknown(token: string): Promise<UnknownItem[]> {
+export async function fetchUnknown(token: string): Promise<UnknownResponse> {
   const r = await fetch("/api/unknown", { headers: authHeaders(token) });
   if (r.status === 401) throw new Error("unauthorized");
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const data = await r.json();
-  return data.items ?? [];
+  return r.json();
 }
 
 export async function fetchConversation(
   token: string,
   product_slug: string,
   conversation_id: string,
-): Promise<ConversationPayload> {
+): Promise<{ messages: Message[]; strategy: Strategy }> {
   const u = new URL("/api/conversation", window.location.origin);
   u.searchParams.set("product_slug", product_slug);
   u.searchParams.set("conversation_id", conversation_id);
