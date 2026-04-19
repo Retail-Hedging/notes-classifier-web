@@ -14,6 +14,7 @@ on first load and stores it in localStorage.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import time
@@ -62,11 +63,45 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _on_startup():
-    """Non-blocking: pool is lazy, cache keepalive fires in the background so
-    the service accepts HTTP traffic immediately on startup."""
+    """Non-blocking: load disk cache so we serve instantly from a cold boot,
+    schedule the hourly background refresh, and if the loaded snapshot is
+    missing message content anywhere, kick off an immediate Phase B fill."""
     _ensure_pool()
+    _load_cache_from_disk()
     asyncio.create_task(_cache_keepalive())
-    log.info("startup complete; cache keepalive scheduled")
+    if _unknown_cache and any(not it.get("messages") for it in _unknown_cache.get("items", [])):
+        log.info("disk cache is missing messages; scheduling immediate fill")
+        asyncio.get_event_loop().run_in_executor(None, _fill_messages_for_current_cache)
+    log.info("startup complete; cache keepalive scheduled (hourly)")
+
+
+def _fill_messages_for_current_cache():
+    """Fill missing messages for items already in _unknown_cache. Used on
+    startup when we loaded a list snapshot from disk but no messages yet."""
+    from concurrent.futures import ThreadPoolExecutor
+    if not _unknown_cache:
+        return
+    try:
+        items_ref = _unknown_cache["items"]
+        todo = [it for it in items_ref if not it.get("messages")]
+        if not todo:
+            return
+        t0 = time.time()
+        log.info(f"fill-on-startup: fetching messages for {len(todo)} items")
+        with ThreadPoolExecutor(max_workers=_POOL_SIZE) as pool:
+            pairs = list(pool.map(_fetch_messages, todo))
+        msg_map = dict(pairs)
+        for it in items_ref:
+            cid = it.get("conversation_id")
+            if not it.get("messages") and cid in msg_map:
+                it["messages"] = msg_map[cid]
+        _persist_cache_to_disk()
+        log.info(
+            f"fill-on-startup: {sum(len(m) for m in msg_map.values())} msgs "
+            f"in {time.time()-t0:.1f}s"
+        )
+    except Exception as e:
+        log.warning(f"fill-on-startup error: {e}")
 
 
 async def _cache_keepalive():
@@ -151,17 +186,64 @@ class McpBorrow:
         _pool.put(self.client)
 
 
-# Cache the UNKNOWN list; background task keeps it warm so the HTTP path is
-# always instant once the service has been up for a few seconds.
+# Cache the UNKNOWN list + messages + strategies. Persisted to disk so
+# restarts don't force a cold re-fetch (MCP is slow and flaky; one warm-up
+# per hour is plenty — and survives process restarts).
 _unknown_cache: dict | None = None
 _unknown_cache_at: float = 0.0
-_UNKNOWN_TTL = 120.0  # stale-while-revalidate: cache served even past TTL
+_UNKNOWN_TTL = 3600.0  # refresh once an hour
+_CACHE_FILE = Path(__file__).parent / "unknown_cache.json"
 _refresh_lock = threading.Lock()
 
-# Product strategy cache — pitch/ICP don't change during a session, no need
-# to re-fetch on every card load.
+# Product strategy cache — pitch/ICP don't change during a session.
 _strategy_cache: dict[str, dict] = {}
 _strategy_cache_lock = threading.Lock()
+
+
+def _load_cache_from_disk() -> None:
+    """Populate in-memory caches from the persisted JSON file if it exists.
+    Called at startup so the service can serve immediately, before any MCP
+    work has happened."""
+    global _unknown_cache, _unknown_cache_at, _strategy_cache
+    try:
+        if not _CACHE_FILE.exists():
+            log.info("no cache file on disk; will fetch cold on first refresh")
+            return
+        with _CACHE_FILE.open("r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+        _unknown_cache = {
+            "count": snapshot.get("count", 0),
+            "items": snapshot.get("items", []),
+            "strategies": snapshot.get("strategies", {}),
+        }
+        _unknown_cache_at = snapshot.get("saved_at", 0.0)
+        _strategy_cache.update(snapshot.get("strategies", {}))
+        age = time.time() - _unknown_cache_at
+        log.info(
+            f"loaded cache from disk: {_unknown_cache['count']} items, "
+            f"age={int(age)}s"
+        )
+    except Exception as e:
+        log.warning(f"failed to load cache from disk: {e}")
+
+
+def _persist_cache_to_disk() -> None:
+    """Atomic write so a crash mid-save doesn't corrupt the file."""
+    if _unknown_cache is None:
+        return
+    try:
+        tmp = _CACHE_FILE.with_suffix(".json.tmp")
+        payload = {
+            "count": _unknown_cache["count"],
+            "items": _unknown_cache["items"],
+            "strategies": _unknown_cache["strategies"],
+            "saved_at": _unknown_cache_at,
+        }
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        tmp.replace(_CACHE_FILE)
+    except Exception as e:
+        log.warning(f"persist cache to disk failed: {e}")
 
 
 # --- Auth dependency ------------------------------------------------------
@@ -311,13 +393,25 @@ def _refresh_unknown_cache() -> dict:
                 list(pool.map(_fetch_strategy_pool, slugs_referenced))
             strategies = {slug: _strategy_cache.get(slug, {}) for slug in slugs_referenced}
 
-            # Phase A: publish list + strategies immediately
+            # Phase A: publish list + strategies immediately (messages carry
+            # over from the previous disk snapshot when we already have them)
+            prev = _unknown_cache or {"items": []}
+            prev_msgs: dict[str, list[dict]] = {
+                it.get("conversation_id"): it.get("messages", [])
+                for it in prev.get("items", [])
+                if it.get("conversation_id")
+            }
+            for it in items:
+                cid = it.get("conversation_id")
+                if cid and prev_msgs.get(cid):
+                    it["messages"] = prev_msgs[cid]  # preserve prior messages
             _unknown_cache = {
                 "count": len(items),
                 "items": items,
                 "strategies": strategies,
             }
             _unknown_cache_at = time.time()
+            _persist_cache_to_disk()
             log.info(
                 f"unknown cache (list) ready: {len(items)} items, "
                 f"{len(strategies)} strategies in {time.time()-t0:.1f}s"
@@ -326,16 +420,24 @@ def _refresh_unknown_cache() -> dict:
             log.exception(f"_refresh_unknown_cache fatal in phase A: {e}")
             return _unknown_cache or {"count": 0, "items": [], "strategies": {}}
 
-        # Phase B: populate messages in background via a daemon thread so we
-        # return from _refresh_unknown_cache now
+        # Phase B: populate messages in background. Only fetch for items that
+        # don't already have messages cached from a previous refresh.
         def _fill_messages(items_ref: list[dict]):
             try:
                 t1 = time.time()
+                todo = [it for it in items_ref if not it.get("messages")]
+                if not todo:
+                    log.info("unknown cache messages: all cached from previous run, skip fetch")
+                    return
+                log.info(f"phase B: fetching messages for {len(todo)}/{len(items_ref)} items")
                 with ThreadPoolExecutor(max_workers=_POOL_SIZE) as pool:
-                    pairs = list(pool.map(_fetch_messages, items_ref))
+                    pairs = list(pool.map(_fetch_messages, todo))
                 msg_map = dict(pairs)
                 for it in items_ref:
-                    it["messages"] = msg_map.get(it["conversation_id"], [])
+                    cid = it.get("conversation_id")
+                    if not it.get("messages") and cid in msg_map:
+                        it["messages"] = msg_map[cid]
+                _persist_cache_to_disk()  # save after messages filled
                 log.info(
                     f"unknown cache messages filled: "
                     f"{sum(len(m) for m in msg_map.values())} msgs "
