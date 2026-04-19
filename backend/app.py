@@ -13,9 +13,12 @@ on first load and stores it in localStorage.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
+import time
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -57,15 +60,86 @@ app.add_middleware(
 )
 
 
-# --- MCP session pool (one long-lived client) -----------------------------
-_mcp: McpClient | None = None
+@app.on_event("startup")
+async def _on_startup():
+    """Non-blocking: pool is lazy, cache keepalive fires in the background so
+    the service accepts HTTP traffic immediately on startup."""
+    _ensure_pool()
+    asyncio.create_task(_cache_keepalive())
+    log.info("startup complete; cache keepalive scheduled")
 
 
-def get_mcp() -> McpClient:
-    global _mcp
-    if _mcp is None:
-        _mcp = McpClient(CLIENT_ID)
-    return _mcp
+async def _cache_keepalive():
+    """Periodically refresh the UNKNOWN cache so HTTP requests always hit warm
+    data. TTL is the cadence — slightly faster than the HTTP-path TTL so users
+    never catch a stale cache boundary."""
+    period = max(10.0, _UNKNOWN_TTL - 5.0)
+    while True:
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _refresh_unknown_cache)
+        except Exception as e:
+            log.exception(f"cache keepalive error: {e}")
+        await asyncio.sleep(period)
+
+
+# --- MCP client pool ------------------------------------------------------
+# MCP sessions are stateful; each must be used by one thread at a time. 14
+# parallel sessions overwhelm the server (observed: 60s+ timeouts), so keep
+# the pool small and gate concurrency with a semaphore.
+_POOL_SIZE = 3
+_pool: "queue.Queue[McpClient]" = None  # type: ignore  # initialised in startup
+
+
+import queue  # noqa: E402
+
+
+_pool_created = 0
+_pool_create_lock = threading.Lock()
+
+
+def _ensure_pool():
+    """Lazy init: creates `queue.Queue` on first use, no blocking at startup."""
+    global _pool
+    if _pool is None:
+        with _pool_create_lock:
+            if _pool is None:
+                _pool = queue.Queue()
+
+
+class McpBorrow:
+    """Context manager: lease one MCP client from the pool, return on exit.
+
+    Clients are created on demand up to _POOL_SIZE. A borrow that finds the pool
+    empty but hasn't hit the cap will build a new client (expensive: MCP init +
+    login takes ~20s) rather than block. This lets the service accept traffic
+    immediately on startup and pays the cost amortized across early requests.
+    """
+    def __enter__(self) -> McpClient:
+        global _pool_created
+        _ensure_pool()
+        try:
+            self.client = _pool.get_nowait()
+        except queue.Empty:
+            with _pool_create_lock:
+                if _pool_created < _POOL_SIZE:
+                    _pool_created += 1
+                    log.info(f"Creating MCP client {_pool_created}/{_POOL_SIZE}")
+                    self.client = McpClient(CLIENT_ID)
+                    return self.client
+            # Cap reached — wait for one to be returned
+            self.client = _pool.get()
+        return self.client
+
+    def __exit__(self, *exc):
+        _pool.put(self.client)
+
+
+# Cache the UNKNOWN list; background task keeps it warm so the HTTP path is
+# always instant once the service has been up for a few seconds.
+_unknown_cache: dict | None = None
+_unknown_cache_at: float = 0.0
+_UNKNOWN_TTL = 45.0  # how stale before /api/unknown triggers a synchronous refresh
+_refresh_lock = threading.Lock()
 
 
 # --- Auth dependency ------------------------------------------------------
@@ -105,12 +179,8 @@ async def health():
     return {"ok": True}
 
 
-@app.get("/api/unknown", dependencies=[Depends(require_token)])
-async def list_unknown():
-    mcp = get_mcp()
-    slugs = _active_products(mcp)
-    items: list[dict] = []
-    for slug in slugs:
+def _fetch_unknown_for(slug: str) -> list[dict]:
+    with McpBorrow() as mcp:
         r = mcp.call("crm_customers_by_state", {
             "product_slug": slug,
             "states": ["UNKNOWN"],
@@ -118,32 +188,66 @@ async def list_unknown():
             "limit": 500,
             "include_conversations": False,
         })
-        for c in (r or {}).get("customers", []):
-            items.append({
-                "product_slug": slug,
-                "conversation_id": c.get("conversation_id"),
-                "customer_name": c.get("customer_name"),
-                "note": (c.get("notes") or "").strip(),
-                "last_message_timestamp": c.get("last_message_timestamp") or "",
-            })
-    items.sort(key=lambda x: x.get("last_message_timestamp", ""), reverse=True)
-    return {"count": len(items), "items": items}
+    out = []
+    for c in (r or {}).get("customers", []):
+        out.append({
+            "product_slug": slug,
+            "conversation_id": c.get("conversation_id"),
+            "customer_name": c.get("customer_name"),
+            "note": (c.get("notes") or "").strip(),
+            "last_message_timestamp": c.get("last_message_timestamp") or "",
+        })
+    return out
 
 
-@app.get("/api/conversation", dependencies=[Depends(require_token)])
-async def get_conversation(product_slug: str, conversation_id: str):
-    mcp = get_mcp()
-    r = mcp.call("get_conversation_by_id", {
-        "product_slug": product_slug,
-        "conversation_id": conversation_id,
-        "client_id": CLIENT_ID,
-    })
-    if not r:
-        raise HTTPException(status_code=404, detail="conversation not found")
-    strat = mcp.call("configure_product_strategy", {
-        "product_slug": product_slug,
-        "client_id": CLIENT_ID,
-    }) or {}
+def _refresh_unknown_cache() -> dict:
+    """Blocking refresh. Coalesces concurrent callers via _refresh_lock so the
+    MCP server sees at most one refresh in flight at a time."""
+    global _unknown_cache, _unknown_cache_at
+    from concurrent.futures import ThreadPoolExecutor
+    with _refresh_lock:
+        # Double-checked: a caller may have refreshed while we waited for the lock
+        now = time.time()
+        if _unknown_cache and (now - _unknown_cache_at) < _UNKNOWN_TTL:
+            return _unknown_cache
+        t0 = time.time()
+        with McpBorrow() as mcp:
+            slugs = _active_products(mcp)
+        # Parallelize across pool — at most _POOL_SIZE concurrent MCP calls
+        with ThreadPoolExecutor(max_workers=_POOL_SIZE) as pool:
+            buckets = list(pool.map(_fetch_unknown_for, slugs))
+        items: list[dict] = [it for bucket in buckets for it in bucket]
+        items.sort(key=lambda x: x.get("last_message_timestamp", ""), reverse=True)
+        _unknown_cache = {"count": len(items), "items": items}
+        _unknown_cache_at = time.time()
+        log.info(f"unknown cache refreshed: {len(items)} items in {time.time()-t0:.1f}s")
+        return _unknown_cache
+
+
+@app.get("/api/unknown", dependencies=[Depends(require_token)])
+async def list_unknown(refresh: bool = False):
+    now = time.time()
+    if _unknown_cache and not refresh and (now - _unknown_cache_at) < _UNKNOWN_TTL:
+        return {**_unknown_cache, "cached": True, "cache_age": int(now - _unknown_cache_at)}
+    # Cold or expired — refresh in a worker thread so the async event loop stays free
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _refresh_unknown_cache)
+    return {**data, "cached": False}
+
+
+def _get_conversation(product_slug: str, conversation_id: str) -> dict:
+    with McpBorrow() as mcp:
+        r = mcp.call("get_conversation_by_id", {
+            "product_slug": product_slug,
+            "conversation_id": conversation_id,
+            "client_id": CLIENT_ID,
+        })
+        if not r:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        strat = mcp.call("configure_product_strategy", {
+            "product_slug": product_slug,
+            "client_id": CLIENT_ID,
+        }) or {}
     mp = (strat.get("current") or {}).get("market_position", {}).get("data", {})
     return {
         "messages": r.get("messages", []),
@@ -155,20 +259,35 @@ async def get_conversation(product_slug: str, conversation_id: str):
     }
 
 
+@app.get("/api/conversation", dependencies=[Depends(require_token)])
+async def get_conversation(product_slug: str, conversation_id: str):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _get_conversation, product_slug, conversation_id)
+
+
+def _change_state(product_slug: str, customer_name: str, category: str) -> bool:
+    with McpBorrow() as mcp:
+        return mcp.call("change_crm_state", {
+            "product_slug": product_slug,
+            "customer_name": customer_name,
+            "category": category,
+            "client_id": CLIENT_ID,
+        }) is not None
+
+
 @app.post("/api/classify", dependencies=[Depends(require_token)])
 async def classify(body: ClassifyBody):
     if body.new_state.upper() not in VALID_STATES:
         raise HTTPException(status_code=400, detail=f"new_state must be one of {sorted(VALID_STATES)}")
-    mcp = get_mcp()
-    result = mcp.call("change_crm_state", {
-        "product_slug": body.product_slug,
-        "customer_name": body.customer_name,
-        "category": body.new_state.upper(),
-        "client_id": CLIENT_ID,
-    })
+    loop = asyncio.get_event_loop()
+    ok = await loop.run_in_executor(None, _change_state, body.product_slug, body.customer_name, body.new_state.upper())
+    result = {"ok": True} if ok else None
     if result is None:
         raise HTTPException(status_code=502, detail="change_crm_state failed")
     log.info(f"reclassified {body.product_slug}/{body.customer_name} -> {body.new_state.upper()}")
+    # Don't invalidate cache — frontend already tracks the local list and
+    # advances past the classified item. The background keepalive will drop
+    # the item on its next refresh cycle (~40s).
     return {"ok": True, "new_state": body.new_state.upper()}
 
 
