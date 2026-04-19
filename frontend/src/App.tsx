@@ -17,6 +17,7 @@ const STATE_BUTTONS: Array<{ value: string; label: string; color: string }> = [
   { value: "DISQUALIFIED", label: "❌ DQ",           color: "bg-red-600 active:bg-red-700" },
   { value: "UNINTERESTED", label: "👎 Uninterested", color: "bg-orange-600 active:bg-orange-700" },
   { value: "UNKNOWN",      label: "❓ Skip",          color: "bg-zinc-700 active:bg-zinc-800" },
+  { value: "REPLY",        label: "💬 Reply",         color: "bg-violet-600 active:bg-violet-700" },
   { value: "CLOSE",        label: "📎 Close",         color: "bg-sky-600 active:bg-sky-700" },
   { value: "CONFIRMED",    label: "✅ Confirmed",    color: "bg-emerald-600 active:bg-emerald-700" },
 ];
@@ -104,7 +105,7 @@ function ConvoCard({
         )}
       </div>
 
-      <div className="p-2 border-t border-zinc-800 bg-zinc-900/80 grid grid-cols-5 gap-1 pb-[max(env(safe-area-inset-bottom),0.5rem)]">
+      <div className="p-2 border-t border-zinc-800 bg-zinc-900/80 grid grid-cols-6 gap-1 pb-[max(env(safe-area-inset-bottom),0.5rem)]">
         {STATE_BUTTONS.map((b) => (
           <button
             key={b.value}

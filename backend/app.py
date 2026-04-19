@@ -49,7 +49,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("classifier-web")
 
-VALID_STATES = {"CONFIRMED", "CLOSE", "UNINTERESTED", "DISQUALIFIED", "UNKNOWN"}
+VALID_STATES = {"CONFIRMED", "CLOSE", "UNINTERESTED", "DISQUALIFIED", "UNKNOWN", "REPLY"}
 FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
 
 app = FastAPI(title="notes-classifier-web")
